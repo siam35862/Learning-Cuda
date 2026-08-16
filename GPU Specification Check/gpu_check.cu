@@ -35,7 +35,6 @@ void checkGPUSpecifications() {
         // Execution Specs
         std::cout << "Multiprocessors (SM Count): " << prop.multiProcessorCount << std::endl;
         std::cout << "Memory Bus Width: " << prop.memoryBusWidth << " bits" << std::endl;
-        std::cout << "Memory Clock Rate: " << prop.memoryClockRate / 1000 << " MHz" << std::endl;
         
         // CUDA Thread & Block Configuration
         std::cout << "------------------------------------------" << std::endl;
