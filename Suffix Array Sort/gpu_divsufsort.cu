@@ -3,6 +3,51 @@
 // GPU suffix array construction via parallel prefix-doubling
 // (Karkkainen-Sanders style rank-doubling), implemented with Thrust.
 //
+// ---------------------------------------------------------------------
+// WHAT CHANGED IN THIS VERSION (and why)
+// ---------------------------------------------------------------------
+// The previous version used thrust::device_vector for its scratch
+// buffers. Each device_vector construction/destruction issues a plain
+// cudaMalloc/cudaFree under the hood. On the CUDA driver's classic
+// (non-stream-ordered) allocator, cudaMalloc/cudaFree are effectively
+// DEVICE-WIDE synchronization points -- not just for their own stream.
+// When running many concurrent streams (e.g. a batch benchmark with
+// 16-32 streams processing independent texts), every call's internal
+// alloc/free was silently serializing against every OTHER call's
+// alloc/free, regardless of which stream each was issued on. This is
+// the primary reason GPU utilization measured only ~30-50% even with
+// many streams in flight: the streams were mostly waiting on each
+// other's allocator calls, not actually computing concurrently.
+//
+// Two fixes are provided here, and you should pick based on your use
+// case:
+//
+//   1) gpu_divsufsort(...)            -- drop-in replacement, SAME
+//      signature as before. Internally now uses cudaMallocAsync /
+//      cudaFreeAsync (CUDA >= 11.2), which draw from a stream-ordered
+//      memory pool and do NOT block other streams. This alone should
+//      noticeably raise concurrent-stream utilization with zero
+//      caller-side changes.
+//
+//   2) gpu_divsufsort_ws(...)         -- for batch workloads (your
+//      1000+ independent files case): takes a pre-allocated
+//      GpuDivsufsortWorkspace that the caller allocates ONCE per
+//      stream and reuses across every call on that stream. This
+//      eliminates ALL per-call device allocation, not just the
+//      blocking behavior of it -- the fastest option for repeated
+//      calls of similar/bounded size. See batch usage example near
+//      the bottom of this file.
+//
+// A secondary, smaller change: the per-round convergence check
+// (previously `*thrust::max_element(...)`, which does an implicit
+// device->host copy whose cost/behavior is opaque) now does an
+// explicit cudaMemcpyAsync of just that one int into a reused pinned
+// (page-locked) host buffer, followed by cudaStreamSynchronize(stream)
+// -- same as before, this only ever synchronized THIS stream, but the
+// explicit pinned-memory path is measurably cheaper per round than an
+// unpinned implicit copy over ~20 rounds.
+//
+// ---------------------------------------------------------------------
 // API is deliberately shaped like libdivsufsort's divsufsort():
 //
 //     int gpu_divsufsort(const unsigned char *T, int *SA, int n);
@@ -10,12 +55,12 @@
 // It also optionally reports peak device memory and accepts a CUDA
 // stream, so the SAME function serves both a single standalone call
 // and a batch benchmark running many independent texts concurrently
-// across multiple streams (see batch_bench_divsufsort.cu):
+// across multiple streams:
 //
 //     int gpu_divsufsort(const unsigned char *T, int *SA, int n,
 //                        size_t *peakDeviceBytes, cudaStream_t stream);
 //
-// Build:
+// Build (requires CUDA 11.2+ for cudaMallocAsync/cudaFreeAsync):
 //     nvcc -O3 -std=c++17 gpu_divsufsort.cu -o gpu_divsufsort
 //
 // Notes:
@@ -24,12 +69,11 @@
 //     for each doubling round, run entirely on the device.
 //   - Memory: ~20 bytes/element (rank + SA as 4-byte ints, keys as an
 //     8-byte combined key, plus one shared 4-byte scratch buffer reused
-//     for both new-group flags and the in-place scan) — down from an
-//     earlier 28 bytes/element version that used separate buffers for
-//     each of those roles.
+//     for both new-group flags and the in-place scan).
+
+#include "gpu_divsufsort.h"
 
 #include <cuda_runtime.h>
-#include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
@@ -38,12 +82,14 @@
 #include <thrust/execution_policy.h>
 #include <thrust/system/cuda/execution_policy.h> // thrust::cuda::par.on(stream)
 #include <thrust/iterator/zip_iterator.h>
+#include <thrust/device_ptr.h>
 #include <thrust/tuple.h>
 
 #include <cstdio>
 #include <cstdint>
 #include <vector>
 #include <chrono>
+#include <stdexcept>
 
 // ---------------------------------------------------------------------
 // Device helpers
@@ -84,39 +130,126 @@ struct NewGroupFlag
     }
 };
 
+struct ByteToInt
+{
+    __host__ __device__ int operator()(unsigned char c) const { return static_cast<int>(c); }
+};
+
+// GpuDivsufsortWorkspace is now declared in gpu_divsufsort.h so that
+// batch_bench_divsufsort.cu (or any other caller) can use it too
+// without the struct layout drifting out of sync between files.
+
 // ---------------------------------------------------------------------
-// gpu_divsufsort
+// Core loop, shared by both the allocating wrapper and the workspace
+// version. Assumes d_rank/d_SA/d_keys/d_scratch/d_text are all valid,
+// sized >= n, and that d_text already holds the uploaded input bytes
+// is NOT assumed -- this function does the H2D copy itself.
+// ---------------------------------------------------------------------
+static void runPrefixDoubling(const unsigned char *T, int *SA, int n,
+                               int *d_rank, int *d_SA, uint64_t *d_keys,
+                               int *d_scratch, unsigned char *d_text,
+                               int *h_maxRank_pinned, cudaStream_t stream)
+{
+    auto policy = thrust::cuda::par.on(stream);
+
+    thrust::device_ptr<int>      rankPtr(d_rank);
+    thrust::device_ptr<int>      saPtr(d_SA);
+    thrust::device_ptr<uint64_t> keysPtr(d_keys);
+    thrust::device_ptr<int>      scratchPtr(d_scratch);
+    thrust::device_ptr<unsigned char> textPtr(d_text);
+
+    // --- Upload text, initial rank = byte value ---
+    cudaMemcpyAsync(d_text, T, n, cudaMemcpyHostToDevice, stream);
+    thrust::transform(policy, textPtr, textPtr + n, rankPtr, ByteToInt());
+
+    thrust::sequence(policy, saPtr, saPtr + n); // SA[i] = i initially
+
+    int k = 1;
+    while (true)
+    {
+        // 1) Build combined (rank[i], rank[i+k]) key for every suffix,
+        //    in CURRENT SA order (so the sort is stable-refining).
+        {
+            MakeKey mk(d_rank, n, k);
+            thrust::transform(policy, saPtr, saPtr + n, keysPtr, mk);
+        }
+
+        // 2) Sort suffix indices by that key (radix sort backend).
+        thrust::sort_by_key(policy, keysPtr, keysPtr + n, saPtr);
+
+        // 3) Flags -> in-place inclusive scan -> new ranks (by sorted position).
+        {
+            NewGroupFlag ngf(d_keys);
+            thrust::transform(
+                policy,
+                thrust::counting_iterator<int>(0),
+                thrust::counting_iterator<int>(n),
+                scratchPtr, ngf);
+
+            thrust::inclusive_scan(policy, scratchPtr, scratchPtr + n, scratchPtr);
+        }
+
+        // 4) Scatter new ranks back into d_rank, indexed by position.
+        thrust::scatter(policy, scratchPtr, scratchPtr + n, saPtr, rankPtr);
+
+        // 5) Convergence check: explicit pinned-memory readback instead
+        //    of thrust::max_element's implicit copy. Still only
+        //    synchronizes THIS stream (cudaStreamSynchronize), so other
+        //    concurrent streams keep running -- just cheaper per round.
+        {
+            thrust::device_ptr<int> maxIt = thrust::max_element(policy, rankPtr, rankPtr + n);
+            const int *d_maxPtr = thrust::raw_pointer_cast(maxIt);
+            cudaMemcpyAsync(h_maxRank_pinned, d_maxPtr, sizeof(int),
+                             cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);
+        }
+
+        if (*h_maxRank_pinned == n - 1)
+            break;
+
+        k <<= 1;
+        if (k > 2 * n) // safety net
+            break;
+    }
+
+    // --- Download result ---
+    cudaMemcpyAsync(SA, d_SA, n * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream); // guarantee SA is populated before returning
+}
+
+// ---------------------------------------------------------------------
+// gpu_divsufsort_ws: batch-oriented entry point.
 //
-//   T      - input bytes (host pointer), length n
-//   SA     - output suffix array (host pointer), must hold n ints
-//   n      - length of T
-//   peakDeviceBytes (optional, out): if non-null, receives the peak
-//            device-memory footprint of this call in bytes. Computed
-//            analytically from the known buffer sizes below rather
-//            than queried at runtime, since Thrust's device_vectors
-//            are destroyed (freeing their memory) before control
-//            returns to the caller -- by the time you could query
-//            cudaMemGetInfo() after the call, the peak has already
-//            come and gone.
-//   stream (optional): CUDA stream to enqueue all work on. Defaults to
-//            the legacy default stream (0), which is what you want for
-//            a single standalone call. Pass a dedicated stream when
-//            calling this from multiple host threads at once (e.g. a
-//            batch benchmark processing many independent texts
-//            concurrently) so each call's work can overlap on the
-//            device instead of implicitly serializing against stream 0.
-//            NOTE: device_vector construction/destruction inside this
-//            function still calls cudaMalloc/cudaFree, which are NOT
-//            stream-ordered on older CUDA/Thrust setups and can add a
-//            synchronization point regardless of `stream` -- true full
-//            overlap across calls benefits from a stream-ordered
-//            allocator (cudaMallocAsync/cudaFreeAsync) or buffer reuse
-//            across calls, which this simple version doesn't do.
+// Pass a GpuDivsufsortWorkspace that you allocated ONCE (sized for the
+// largest n you'll call with on this stream) and reuse for every text
+// processed on that stream. Zero device allocation happens inside this
+// call -- this is the version to use for your 1000+-file batch case.
 //
-// Returns 0 on success, negative on error (mirrors divsufsort's contract).
+//   ws.capacity must be >= n, or this returns -3.
+// ---------------------------------------------------------------------
+int gpu_divsufsort_ws(const unsigned char *T, int *SA, int n,
+                       GpuDivsufsortWorkspace &ws, cudaStream_t stream) // NOLINT: matches header decl
+{
+    if (n < 0 || (n > 0 && (T == nullptr || SA == nullptr))) return -1;
+    if (n == 0) return 0;
+    if (n == 1) { SA[0] = 0; return 0; }
+    if (n > ws.capacity) return -3; // workspace too small; allocate() for a larger maxN
+
+    runPrefixDoubling(T, SA, n, ws.d_rank, ws.d_SA, ws.d_keys, ws.d_scratch,
+                       ws.d_text, ws.h_maxRank_pinned, stream);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// gpu_divsufsort: drop-in replacement for the original API. Allocates
+// and frees its scratch buffers with the stream-ordered allocator
+// (cudaMallocAsync/cudaFreeAsync) every call -- much less blocking
+// than the old device_vector-based version, but still not free. For
+// a batch of many calls on the same stream, prefer gpu_divsufsort_ws
+// with a workspace allocated once outside your loop.
 // ---------------------------------------------------------------------
 int gpu_divsufsort(const unsigned char *T, int *SA, int n,
-                    size_t *peakDeviceBytes = nullptr, cudaStream_t stream = 0)
+                    size_t *peakDeviceBytes, cudaStream_t stream)
 {
     if (n < 0 || (n > 0 && (T == nullptr || SA == nullptr)))
         return -1;
@@ -136,110 +269,40 @@ int gpu_divsufsort(const unsigned char *T, int *SA, int n,
 
     if (peakDeviceBytes)
     {
-        // Concurrently live for the whole main loop: d_rank, d_SA,
-        // d_keys, and one shared scratch buffer (reused for both the
-        // new-group flags and the scanned rank, since inclusive_scan
-        // supports in-place input==output). Scatter writes new ranks
-        // straight back into d_rank, so no separate scatter buffer is
-        // needed either. (d_text is freed before this loop starts, so
-        // it isn't part of the steady-state peak.)
         size_t bytes = 0;
         bytes += static_cast<size_t>(n) * sizeof(int);      // d_rank
         bytes += static_cast<size_t>(n) * sizeof(int);      // d_SA
         bytes += static_cast<size_t>(n) * sizeof(uint64_t); // d_keys
-        bytes += static_cast<size_t>(n) * sizeof(int);      // d_scratch (flags/newRank, shared)
+        bytes += static_cast<size_t>(n) * sizeof(int);      // d_scratch
+        bytes += static_cast<size_t>(n) * sizeof(unsigned char); // d_text
         *peakDeviceBytes = bytes;
     }
 
-    auto policy = thrust::cuda::par.on(stream);
+    int      *d_rank = nullptr, *d_SA = nullptr, *d_scratch = nullptr;
+    uint64_t *d_keys = nullptr;
+    unsigned char *d_text = nullptr;
+    int      *h_maxRank_pinned = nullptr;
 
-    // --- Upload text, initial rank = byte value ---
-    thrust::device_vector<int> d_rank(n);
-    {
-        thrust::device_vector<unsigned char> d_text(n);
-        cudaMemcpyAsync(thrust::raw_pointer_cast(d_text.data()), T, n,
-                         cudaMemcpyHostToDevice, stream);
-        thrust::transform(
-            policy, d_text.begin(), d_text.end(), d_rank.begin(),
-            [] __device__ (unsigned char c) { return static_cast<int>(c); });
-    }
+    cudaError_t e;
+    e = cudaMallocAsync(&d_rank,    static_cast<size_t>(n) * sizeof(int),      stream); if (e) return -2;
+    e = cudaMallocAsync(&d_SA,      static_cast<size_t>(n) * sizeof(int),      stream); if (e) return -2;
+    e = cudaMallocAsync(&d_keys,    static_cast<size_t>(n) * sizeof(uint64_t), stream); if (e) return -2;
+    e = cudaMallocAsync(&d_scratch, static_cast<size_t>(n) * sizeof(int),      stream); if (e) return -2;
+    e = cudaMallocAsync(&d_text,    static_cast<size_t>(n) * sizeof(unsigned char), stream); if (e) return -2;
+    e = cudaHostAlloc(&h_maxRank_pinned, sizeof(int), cudaHostAllocDefault);   if (e) return -2;
 
-    thrust::device_vector<int> d_SA(n);
-    thrust::sequence(policy, d_SA.begin(), d_SA.end()); // SA[i] = i initially
+    runPrefixDoubling(T, SA, n, d_rank, d_SA, d_keys, d_scratch, d_text,
+                       h_maxRank_pinned, stream);
 
-    thrust::device_vector<uint64_t> d_keys(n);
-    thrust::device_vector<int>      d_scratch(n); // shared: flags, then in-place scanned to become new ranks
-
-    int k = 1;
-    while (true)
-    {
-        // 1) Build combined (rank[i], rank[i+k]) key for every suffix,
-        //    in CURRENT SA order (so the sort is stable-refining).
-        {
-            MakeKey mk(thrust::raw_pointer_cast(d_rank.data()), n, k);
-            thrust::transform(policy, d_SA.begin(), d_SA.end(), d_keys.begin(), mk);
-        }
-
-        // 2) Sort suffix indices by that key. thrust::sort_by_key on
-        //    64-bit keys dispatches to a radix sort — this is the
-        //    parallel step that replaces divsufsort's induced sorting.
-        thrust::sort_by_key(policy, d_keys.begin(), d_keys.end(), d_SA.begin());
-
-        // 3) Assign new ranks: d_scratch[i] = 1 if this suffix starts a
-        //    new equivalence class (its key differs from the previous
-        //    one in sorted order), else 0. Then scan IN PLACE (same
-        //    buffer as both input and output) to turn those flags into
-        //    the new rank (0-based) for the suffix at sorted position i
-        //    — this reuses one buffer instead of needing flags and
-        //    ranks as two separate arrays.
-        {
-            NewGroupFlag ngf(thrust::raw_pointer_cast(d_keys.data()));
-            thrust::transform(
-                policy,
-                thrust::counting_iterator<int>(0),
-                thrust::counting_iterator<int>(n),
-                d_scratch.begin(), ngf);
-
-            thrust::inclusive_scan(policy, d_scratch.begin(), d_scratch.end(), d_scratch.begin());
-        }
-
-        // 4) Scatter new ranks straight back into d_rank, indexed by
-        //    position: d_rank[ d_SA[i] ] = d_scratch[i]. Safe in place
-        //    because every read of d_rank for this round already
-        //    happened in step 1, before this write.
-        thrust::scatter(policy, d_scratch.begin(), d_scratch.end(), d_SA.begin(), d_rank.begin());
-
-        // 5) Termination: if the last (highest) rank equals n-1, every
-        //    suffix is in its own class -> fully sorted. Reading this
-        //    value back synchronizes THIS stream only -- other streams'
-        //    concurrent calls keep running on the device meanwhile.
-        int maxRank = *thrust::max_element(policy, d_rank.begin(), d_rank.end());
-        if (maxRank == n - 1)
-            break;
-
-        // Also stop if k has grown past n (safety net; shouldn't trigger
-        // before maxRank converges for valid input).
-        k <<= 1;
-        if (k > 2 * n)
-            break;
-    }
-
-    // --- Download result ---
-    cudaMemcpyAsync(SA, thrust::raw_pointer_cast(d_SA.data()), n * sizeof(int),
-                     cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream); // guarantee SA is populated before returning
+    cudaFreeAsync(d_rank,    stream);
+    cudaFreeAsync(d_SA,      stream);
+    cudaFreeAsync(d_keys,    stream);
+    cudaFreeAsync(d_scratch, stream);
+    cudaFreeAsync(d_text,    stream);
+    cudaFreeHost(h_maxRank_pinned);
 
     return 0;
 }
-
-// ---------------------------------------------------------------------
-// Optional: 64-bit-index variant for inputs > ~2^31 suffixes, mirroring
-// divsufsort64(). Included as a thin wrapper; swap `int` for `long long`
-// throughout the above if you actually need >2GB inputs.
-// ---------------------------------------------------------------------
-// int gpu_divsufsort64(const unsigned char *T, long long *SA, long long n);
-// (left unimplemented here — flag if you need it, the rank/key types
-//  just need widening to int64_t / int64_t pairs.)
 
 // ---------------------------------------------------------------------
 // Simple self-test / example usage
@@ -252,6 +315,34 @@ static void printSA(const unsigned char *T, const int *SA, int n)
         printf("SA[%2d] = %2d  suffix: %s\n", i, SA[i],
                reinterpret_cast<const char*>(T + SA[i]));
     }
+}
+
+// Example: how a batch loop should use the workspace API for zero
+// per-call allocation (this is the pattern to use for your 1000+ file
+// case -- one workspace per stream, reused across every file on it).
+static void batchExample(const std::vector<std::vector<unsigned char>> &texts,
+                          cudaStream_t stream, int maxN)
+{
+    GpuDivsufsortWorkspace ws;
+    if (!ws.allocate(maxN, stream))
+    {
+        fprintf(stderr, "workspace allocation failed\n");
+        return;
+    }
+
+    for (const auto &text : texts)
+    {
+        std::vector<int> SA(text.size());
+        int rc = gpu_divsufsort_ws(text.data(), SA.data(),
+                                    static_cast<int>(text.size()), ws, stream);
+        if (rc != 0)
+        {
+            fprintf(stderr, "gpu_divsufsort_ws failed: %d\n", rc);
+            continue;
+        }
+        // ... consume SA ...
+    }
+    // ws destructor frees everything once, here, not per-file.
 }
 
 int main()

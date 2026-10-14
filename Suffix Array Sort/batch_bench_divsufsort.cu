@@ -6,11 +6,28 @@
 //      a shared queue (fair "CPU parallel" baseline).
 //   3. GPU, using a small pool of CUDA STREAMS so multiple texts'
 //      suffix-array construction genuinely overlaps on the device.
-//      Uses the SAME gpu_divsufsort() from gpu_divsufsort.cu as the
-//      single-call benchmark (bench_divsufsort.cu) -- just passing it
-//      a per-thread stream instead of the default.
 //
-// Default: 1000 texts x 1 MiB each (override via CLI args).
+// ---------------------------------------------------------------------
+// WHAT CHANGED IN THIS VERSION
+// ---------------------------------------------------------------------
+// The GPU path now uses gpu_divsufsort_ws() with a PRE-ALLOCATED
+// GpuDivsufsortWorkspace per stream, instead of calling the allocating
+// gpu_divsufsort() once per text. Each worker thread allocates its
+// stream's workspace ONCE, before pulling any work off the queue, then
+// reuses it for every text it processes. This eliminates all
+// per-call device allocation traffic on the GPU path -- previously,
+// every single one of the 1000 calls did its own cudaMalloc*/
+// cudaFree*, which (even with the async allocator) adds up over many
+// calls and was measured capping GPU utilization at ~30-50% during
+// concurrent-stream runs. With workspace reuse, utilization should be
+// substantially higher.
+//
+// One consequence: this version assumes all texts are the SAME SIZE
+// (as the benchmark already does -- numTexts x textBytes). If you
+// adapt this for texts of varying sizes, size each workspace for the
+// LARGEST text it will ever see, or resize/reallocate per stream
+// lazily on first oversize text (see gpu_divsufsort_ws's -3 return
+// code, which signals "workspace too small").
 //
 // Build (compiles together with gpu_divsufsort.cu -- no duplicated
 // algorithm code, one source of truth for the GPU implementation):
@@ -25,19 +42,20 @@
 //
 // Notes on the GPU path:
 //   - Concurrency comes from having several HOST THREADS, each driving
-//     one dedicated stream through a shared work queue. Each thread's
-//     call to gpu_divsufsort() blocks that thread on its own stream's
-//     results, but other streams' work keeps running on the GPU in the
-//     meantime.
+//     one dedicated stream (and that stream's own workspace) through a
+//     shared work queue.
 //   - Host-side text/result buffers here are ordinary (pageable)
 //     memory, not pinned -- simplest to get right first. Pinned memory
 //     (cudaHostAlloc) would let the H2D/D2H copies themselves overlap
 //     across streams too; ask if you want that version.
-//   - Memory: with S concurrent streams and per-text footprint of
-//     ~20 bytes/byte-of-text (see gpu_divsufsort.cu), total device
-//     memory is roughly S * (24 * textBytes). Keep S modest relative
-//     to your VRAM -- gpu_divsufsort()'s peakDeviceBytes out-param can
-//     confirm the exact per-call figure if you want to size this.
+//   - Memory: with S concurrent streams, each workspace holds ~24
+//     bytes/byte-of-text (rank+SA+keys+scratch+text, see
+//     gpu_divsufsort.h), allocated ONCE per stream now rather than
+//     once per call. Total device memory is roughly
+//     S * 24 * textBytes -- same order of magnitude as before, just
+//     allocated once instead of numTexts/S times.
+
+#include "gpu_divsufsort.h"
 
 #include <divsufsort.h>
 
@@ -53,10 +71,6 @@
 #include <thread>
 #include <atomic>
 #include <iostream>
-
-// Declared in gpu_divsufsort.cu.
-int gpu_divsufsort(const unsigned char *T, int *SA, int n,
-                    size_t *peakDeviceBytes = nullptr, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -99,9 +113,15 @@ int main(int argc, char **argv)
 
     auto texts = makeTexts(numTexts, textLen);
 
+    // Only saCpu is kept as the full ground-truth array (needed at the
+    // end to verify GPU output). saCpuMT and saGpu results are NEVER
+    // inspected beyond "does it match saCpu" -- so instead of storing
+    // all 1000 of each (which was ~12.4 GiB combined on a 15 GiB
+    // system and pushed the OS into paging/swap, badly skewing the
+    // CPU-MT timing), each worker below uses a small per-thread/
+    // per-stream REUSABLE buffer and discards it immediately after
+    // use. This cuts host RAM use from ~12.4 GiB to ~4.8 GiB.
     std::vector<std::vector<int>> saCpu(numTexts, std::vector<int>(textLen));
-    std::vector<std::vector<int>> saCpuMT(numTexts, std::vector<int>(textLen));
-    std::vector<std::vector<int>> saGpu(numTexts, std::vector<int>(textLen));
 
     // --- 1) CPU, single-threaded ---
     double cpuMs = timeMs([&]() {
@@ -113,6 +133,9 @@ int main(int argc, char **argv)
     });
 
     // --- 2) CPU, multi-threaded (shared queue, one thread per core) ---
+    // Each worker reuses its OWN buffer across every text it processes
+    // -- result is discarded (only timing matters here), so there is
+    // no need to keep 1000 separate result arrays alive at once.
     std::atomic<int> nextIdxMT{0};
     unsigned hwThreads = std::max(1u, std::thread::hardware_concurrency());
     double cpuMtMs = timeMs([&]() {
@@ -120,40 +143,77 @@ int main(int argc, char **argv)
         for (unsigned w = 0; w < hwThreads; ++w)
         {
             pool.emplace_back([&]() {
+                std::vector<int> localSA(textLen); // reused every iteration
                 int idx;
                 while ((idx = nextIdxMT.fetch_add(1)) < numTexts)
-                    divsufsort(texts[idx].data(), saCpuMT[idx].data(), static_cast<int>(textLen));
+                    divsufsort(texts[idx].data(), localSA.data(), static_cast<int>(textLen));
             });
         }
         for (auto &th : pool) th.join();
     });
 
-    // --- 3) GPU, concurrent streams (shared queue, one thread per stream) ---
+    // --- 3) GPU, concurrent streams, ONE WORKSPACE PER STREAM ---
+    // Each worker thread owns exactly one stream and one workspace,
+    // both created before the thread touches the shared work queue,
+    // and both reused for every text that thread pulls. No device
+    // allocation happens inside the timed loop below.
     std::vector<cudaStream_t> streams(numStreams);
     for (auto &s : streams) cudaStreamCreate(&s);
 
-    size_t gpuPeakPerCallBytes = 0; // same for every call at a given textLen
+    std::vector<GpuDivsufsortWorkspace> workspaces(numStreams);
+    bool wsOk = true;
+    for (int s = 0; s < numStreams; ++s)
+        wsOk &= workspaces[s].allocate(static_cast<int>(textLen), streams[s]);
+    if (!wsOk)
+    {
+        std::cerr << "Workspace allocation failed (out of VRAM for "
+                  << numStreams << " streams x " << textLen << " bytes each?)\n";
+        return 1;
+    }
+
+    // gpu_divsufsort_ws doesn't report peakDeviceBytes directly (the
+    // workspace's own allocate() already tells you the size you asked
+    // for); compute the same ~24 bytes/element figure here for the
+    // printout below, matching what gpu_divsufsort.h's buffers hold.
+    size_t gpuPerWorkspaceBytes =
+        static_cast<size_t>(textLen) * (sizeof(int) * 3 + sizeof(uint64_t) + sizeof(unsigned char));
+
+    // Each GPU worker also reuses its own host-side result buffer, and
+    // verifies against saCpu[idx] IMMEDIATELY after each call instead
+    // of stashing all 1000 results for a separate comparison pass
+    // afterward -- same reasoning as the CPU-MT change above.
     std::atomic<int> nextIdxGpu{0};
+    std::atomic<bool> allMatch{true};
     double gpuMs = timeMs([&]() {
         std::vector<std::thread> pool;
         for (int s = 0; s < numStreams; ++s)
         {
             pool.emplace_back([&, s]() {
+                std::vector<int> localSA(textLen); // reused every iteration
                 int idx;
                 while ((idx = nextIdxGpu.fetch_add(1)) < numTexts)
-                    gpu_divsufsort(texts[idx].data(), saGpu[idx].data(),
-                                   static_cast<int>(textLen), &gpuPeakPerCallBytes, streams[s]);
+                {
+                    int rc = gpu_divsufsort_ws(texts[idx].data(), localSA.data(),
+                                                static_cast<int>(textLen), workspaces[s], streams[s]);
+                    if (rc != 0)
+                    {
+                        std::cerr << "gpu_divsufsort_ws failed on text " << idx << ": rc=" << rc << "\n";
+                        allMatch = false;
+                        continue;
+                    }
+                    if (localSA != saCpu[idx])
+                    {
+                        std::cerr << "Mismatch on text " << idx << "\n";
+                        allMatch = false;
+                    }
+                }
             });
         }
         for (auto &th : pool) th.join();
     });
 
+    for (auto &ws : workspaces) ws.release(); // also runs in destructor, explicit here for clarity
     for (auto &s : streams) cudaStreamDestroy(s);
-
-    // --- Verify correctness against the CPU baseline ---
-    bool allMatch = true;
-    for (int t = 0; t < numTexts && allMatch; ++t)
-        if (saCpu[t] != saGpu[t]) { allMatch = false; std::cerr << "Mismatch on text " << t << "\n"; }
 
     double totalMiB = (numTexts * textLen) / (1024.0 * 1024.0);
     std::cout << "-----------------------------------------\n";
@@ -163,9 +223,9 @@ int main(int argc, char **argv)
     std::cout << "-----------------------------------------\n";
     std::cout << "Speedup GPU vs CPU(1)  : " << (cpuMs / gpuMs)   << "x\n";
     std::cout << "Speedup GPU vs CPU(MT) : " << (cpuMtMs / gpuMs) << "x\n";
-    std::cout << "Per-call GPU device memory: " << (gpuPeakPerCallBytes / (1024.0 * 1024.0)) << " MiB"
+    std::cout << "Per-stream GPU workspace: " << (gpuPerWorkspaceBytes / (1024.0 * 1024.0)) << " MiB"
               << "  (x" << numStreams << " concurrent = ~"
-              << (gpuPeakPerCallBytes * numStreams / (1024.0 * 1024.0)) << " MiB total)\n";
+              << (gpuPerWorkspaceBytes * numStreams / (1024.0 * 1024.0)) << " MiB total, allocated ONCE not per-call)\n";
     std::cout << "Result match (GPU vs CPU): " << (allMatch ? "YES" : "NO") << "\n";
 
     return allMatch ? 0 : 2;

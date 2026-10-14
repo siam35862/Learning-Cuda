@@ -129,7 +129,9 @@ static double toMiB(size_t bytes) { return bytes / (1024.0 * 1024.0); }
 int main(int argc, char **argv)
 {
     std::vector<unsigned char> text;
-    size_t n = 1u << 25; // 1M chars default
+    int m;
+    std::cin>>m;
+    size_t n = 1u << m; // 1M chars default
 
     if (argc >= 2 && std::string(argv[1]) == "--file")
     {
